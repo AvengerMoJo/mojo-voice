@@ -26,6 +26,12 @@ class CosyVoiceTTS:
         self._engine = None
         self._runtime_name = "CosyVoice"
         self._effective_speaker = speaker
+        # CosyVoice3 zero-shot: path to reference WAV and instruct prefix
+        self._prompt_wav: str | None = os.getenv("COSYVOICE_PROMPT_WAV") or _find_default_prompt_wav()
+        self._instruct_text: str = os.getenv(
+            "COSYVOICE_INSTRUCT_TEXT",
+            "You are a helpful assistant. 请用普通话说。<|endofprompt|>",
+        )
 
     def load(self) -> None:
         if self._engine is not None:
@@ -57,11 +63,26 @@ class CosyVoiceTTS:
 
     def synthesize_wav(self, text: str) -> bytes:
         self.load()
-        assert self._engine is not None
+        if self._engine is None:
+            raise RuntimeError("TTS engine failed to load")
 
         chunks = []
         try:
-            for out in self._engine.inference_sft(text, self._effective_speaker, stream=False):
+            # CosyVoice3 has no SFT speakers — use instruct2 (zero-shot) mode
+            if self._runtime_name == "CosyVoice3" or not self._effective_speaker:
+                if not self._prompt_wav:
+                    raise RuntimeError(
+                        "CosyVoice3 requires a reference WAV. "
+                        "Set COSYVOICE_PROMPT_WAV to a .wav file path."
+                    )
+                logger.info("Using instruct2 mode with prompt_wav=%s", self._prompt_wav)
+                gen = self._engine.inference_instruct2(
+                    text, self._instruct_text, self._prompt_wav, stream=False
+                )
+            else:
+                gen = self._engine.inference_sft(text, self._effective_speaker, stream=False)
+
+            for out in gen:
                 if "tts_speech" in out:
                     chunks.append(out["tts_speech"])
             if not chunks:
@@ -114,6 +135,15 @@ def _float_pcm_to_wav_bytes(samples, sample_rate: int) -> bytes:
 
 # Backward-compat alias used by older imports.
 CosyVoice2TTS = CosyVoiceTTS
+
+
+def _find_default_prompt_wav() -> str | None:
+    this_file = os.path.abspath(__file__)
+    poc_dir = os.path.dirname(os.path.dirname(this_file))
+    candidate = os.path.join(poc_dir, ".vendor", "CosyVoice", "asset", "zero_shot_prompt.wav")
+    if os.path.isfile(candidate):
+        return candidate
+    return None
 
 
 def _ensure_local_cosyvoice_paths() -> None:
