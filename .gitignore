@@ -15,9 +15,9 @@ venv/
 poc/.venv/
 
 # Model weights and caches — never commit these
-poc/~/.cache/
 poc/pretrained_models/
 poc/.cache/
+poc/.sample/*.wav
 *.pt
 *.pth
 *.onnx
