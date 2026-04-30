@@ -111,7 +111,7 @@ class VoiceService:
                 session.original_ask = transcript
 
         prompt = self._build_audio_brain_prompt(transcript, session)
-        reply_text = await self._ask_mcp(prompt, mode=mode, role_id=role_id)
+        reply_text = await self._ask_audio_brain(prompt)
 
         # Push any clarification the audio brain produced back to the context queue
         if session:
@@ -220,7 +220,47 @@ class VoiceService:
         return item
 
     # ------------------------------------------------------------------ #
-    # MCP helpers (unchanged from original)                              #
+    # Audio brain — routes through fastest free resource via MoJo pool  #
+    # ------------------------------------------------------------------ #
+
+    async def _ask_audio_brain(self, user_message: str) -> str:
+        """
+        Single-turn LLM call for the audio brain conductor.
+        Uses llm_direct_chat which picks the fastest benchmarked free resource.
+        The system prompt is passed separately so the model treats it correctly.
+        """
+        # Split the built prompt: first section is system, last line is user message
+        # _build_audio_brain_prompt appends "\nUser said: {transcript}" at the end.
+        # We pass the conductor instructions as system_prompt and the user turn separately.
+        lines = user_message.rsplit("\nUser said: ", 1)
+        if len(lines) == 2:
+            system_part = lines[0].strip()
+            user_part = lines[1].strip()
+        else:
+            system_part = _AUDIO_BRAIN_SYSTEM.strip()
+            user_part = user_message.strip()
+
+        result = await self.client.call_tool(
+            "llm_direct_chat",
+            {
+                "system_prompt": system_part,
+                "message": user_part,
+                "max_tokens": 256,
+            },
+        )
+        payload = result.tool_payload()
+        if payload.get("status") == "error":
+            logger.warning("llm_direct_chat error: %s", payload.get("message"))
+            return "I'm still thinking, give me a moment."
+
+        reply = (payload.get("reply") or "").strip()
+        resource = payload.get("resource_id", "")
+        model = payload.get("model", "")
+        logger.info("Audio brain reply via %s (%s): %s chars", resource, model, len(reply))
+        return reply or "I'm still processing your request."
+
+    # ------------------------------------------------------------------ #
+    # MCP helpers — used for memory/dialog fallback and push synthesis   #
     # ------------------------------------------------------------------ #
 
     async def _ask_mcp(
