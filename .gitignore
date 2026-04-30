@@ -1,4 +1,36 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.venv/
+venv/
 poc/.venv/
-poc/.env
+
+# Model weights and caches — never commit these
+poc/~/.cache/
+poc/pretrained_models/
+poc/.cache/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+*.gguf
+*.fst
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
