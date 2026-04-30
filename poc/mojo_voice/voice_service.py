@@ -240,11 +240,13 @@ class VoiceService:
             system_part = _AUDIO_BRAIN_SYSTEM.strip()
             user_part = user_message.strip()
 
+        resource_id = os.getenv("AUDIO_BRAIN_RESOURCE_ID", "lmstudio")
         result = await self.client.call_tool(
             "llm_direct_chat",
             {
                 "system_prompt": system_part,
                 "message": user_part,
+                "resource_id": resource_id,
                 "max_tokens": 256,
             },
         )
