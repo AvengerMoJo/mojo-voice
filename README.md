@@ -52,6 +52,7 @@ Required env vars:
 Optional:
 - `MOJO_VOICE_RUNTIME=mock|executorch` (default `mock`)
 - `MOJO_MCP_MODE=search_memory|dialog` (default `search_memory`)
+- `MOJO_STT_PROVIDER=funasr|zai_asr` (default `funasr`, strict fail if misconfigured)
 
 ## Audio Base64 API (Frontend -> Backend)
 
@@ -77,6 +78,14 @@ python run_voice_api.py
   "audio_base64": "<base64-audio-or-data-uri>",
   "mcp_mode": "search_memory",
   "role_id": "assistant"
+}
+```
+
+- `POST /voice/transcribe` (STT only, no TTS/MCP side effects)
+- Body:
+```json
+{
+  "audio_base64": "<base64-audio-or-data-uri>"
 }
 ```
 
@@ -123,6 +132,18 @@ After install, set:
 - `COSYVOICE_SPEAKER` in `.env`
 
 If these are not installed/configured, `/voice/query` will return a setup error.
+
+## Z.AI GLM-ASR provider path
+
+Use cloud ASR without changing your voice API contract:
+
+```bash
+export MOJO_STT_PROVIDER=zai_asr
+export ZAI_API_KEY=...
+export ZAI_ASR_MODEL=glm-asr-2512
+```
+
+The service fails fast on invalid provider config and does not silently fall back.
 
 ## Mobile Integration Notes
 

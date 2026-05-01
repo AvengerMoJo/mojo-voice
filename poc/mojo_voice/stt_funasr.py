@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 
 from .funasr_transcription import FunASRTranscription
+from .stt_base import STTResult
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class STTResult:
-    text: str
-    raw: object
 
 
 class FunASRSTT:

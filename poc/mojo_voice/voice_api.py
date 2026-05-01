@@ -31,6 +31,10 @@ class VoiceQueryResponse(BaseModel):
     session_id: str | None = None
 
 
+class VoiceTranscribeResponse(BaseModel):
+    transcript: str
+
+
 class SessionCreateResponse(BaseModel):
     session_id: str
 
@@ -169,6 +173,16 @@ async def voice_query(req: VoiceQueryRequest):
     )
 
 
+@app.post("/voice/transcribe", response_model=VoiceTranscribeResponse)
+async def voice_transcribe(req: VoiceQueryRequest):
+    service: VoiceService = app.state.voice_service
+    try:
+        transcript = service.transcribe_audio_base64(req.audio_base64)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return VoiceTranscribeResponse(transcript=transcript)
+
+
 # ------------------------------------------------------------------ #
 # Push — text brain → audio queue                                     #
 # ------------------------------------------------------------------ #
@@ -198,6 +212,8 @@ async def push_to_session(session_id: str, req: PushRequest):
 @app.get("/voice/pending/{session_id}", response_model=PendingAudioResponse)
 async def pending_audio(session_id: str):
     service: VoiceService = app.state.voice_service
+    if store.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
     item = service.pop_pending_audio(session_id)
     if item is None:
         return PendingAudioResponse(pending=False)
@@ -216,6 +232,8 @@ async def pending_audio(session_id: str):
 @app.get("/voice/context/{session_id}", response_model=PendingContextResponse)
 async def pending_context(session_id: str):
     service: VoiceService = app.state.voice_service
+    if store.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
     item = service.pop_pending_context(session_id)
     if item is None:
         return PendingContextResponse(update=False)

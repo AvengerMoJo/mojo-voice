@@ -12,6 +12,7 @@ class VoicePoCConfig:
     role_id: str
     voice_runtime: str
     mcp_mode: str
+    stt_provider: str
 
 
 def load_config() -> VoicePoCConfig:
@@ -34,4 +35,5 @@ def load_config() -> VoicePoCConfig:
         role_id=os.getenv("MOJO_ROLE_ID", "assistant").strip(),
         voice_runtime=runtime,
         mcp_mode=mcp_mode,
+        stt_provider=os.getenv("MOJO_STT_PROVIDER", "funasr").strip().lower(),
     )

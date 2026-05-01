@@ -16,6 +16,8 @@ from .config import VoicePoCConfig
 from .mcp_client import MCPClient
 from .session_store import AudioQueueItem, ContextUpdate, VoiceSession, store
 from .stt_funasr import FunASRSTT
+from .stt_base import STTEngine
+from .stt_zai import ZaiASRSTT
 from .tts_cosyvoice2 import CosyVoiceTTS
 
 logger = logging.getLogger(__name__)
@@ -56,16 +58,7 @@ class VoiceService:
         self.cfg = cfg
         self.client = MCPClient(cfg.mcp_url, cfg.mcp_api_key)
 
-        funasr_model = os.getenv("FUNASR_MODEL", "iic/SenseVoiceSmall")
-        funasr_vad = os.getenv("FUNASR_VAD_MODEL", "fsmn-vad")
-        funasr_punc = os.getenv("FUNASR_PUNC_MODEL", "ct-punc")
-        funasr_device = os.getenv("FUNASR_DEVICE", "cpu")
-        self.stt = FunASRSTT(
-            model=funasr_model,
-            vad_model=funasr_vad,
-            punc_model=funasr_punc,
-            device=funasr_device,
-        )
+        self.stt: STTEngine = self._build_stt_engine(cfg.stt_provider)
 
         cosy_model_path = os.getenv(
             "COSYVOICE_MODEL_PATH",
@@ -76,6 +69,26 @@ class VoiceService:
             os.getenv("COSYVOICE2_SPEAKER", ""),
         )
         self.tts = CosyVoiceTTS(model_path=cosy_model_path, speaker=cosy_speaker)
+
+    def _build_stt_engine(self, provider: str) -> STTEngine:
+        p = (provider or "").strip().lower()
+        if p == "funasr":
+            funasr_model = os.getenv("FUNASR_MODEL", "iic/SenseVoiceSmall")
+            funasr_vad = os.getenv("FUNASR_VAD_MODEL", "fsmn-vad")
+            funasr_punc = os.getenv("FUNASR_PUNC_MODEL", "ct-punc")
+            funasr_device = os.getenv("FUNASR_DEVICE", "cpu")
+            return FunASRSTT(
+                model=funasr_model,
+                vad_model=funasr_vad,
+                punc_model=funasr_punc,
+                device=funasr_device,
+            )
+        if p == "zai_asr":
+            return ZaiASRSTT.from_env()
+        raise RuntimeError(
+            f"Unsupported MOJO_STT_PROVIDER={provider!r}. "
+            "Supported providers: funasr, zai_asr"
+        )
 
     async def initialize(self) -> None:
         await self.client.initialize()
@@ -110,8 +123,23 @@ class VoiceService:
             if not session.original_ask:
                 session.original_ask = transcript
 
-        prompt = self._build_audio_brain_prompt(transcript, session)
-        reply_text = await self._ask_audio_brain(prompt)
+        selected_mode = (mode or self.cfg.mcp_mode or "").strip().lower()
+        # If caller explicitly asks for MCP-backed answer path, route directly.
+        if selected_mode in ("search_memory", "dialog"):
+            reply_text = await self._ask_mcp(transcript, selected_mode, role_id)
+        else:
+            prompt = self._build_audio_brain_prompt(transcript, session)
+            reply_text = await self._ask_audio_brain(prompt)
+            # Fallback: if audio brain returns placeholder/empty, fetch real MCP answer.
+            if not reply_text.strip() or reply_text.strip().lower() in (
+                "i'm still processing your request.",
+                "i'm still thinking, give me a moment.",
+            ):
+                reply_text = await self._ask_mcp(
+                    transcript,
+                    self.cfg.mcp_mode or "search_memory",
+                    role_id or self.cfg.role_id,
+                )
 
         # Push any clarification the audio brain produced back to the context queue
         if session:
@@ -124,6 +152,19 @@ class VoiceService:
             reply_audio_base64=encode_audio_base64(wav_out),
             session_id=session.session_id if session else session_id,
         )
+
+    def transcribe_audio_base64(self, audio_base64: str) -> str:
+        audio_bytes = decode_audio_base64(audio_base64)
+        wav16k = to_wav16k_mono_bytes(audio_bytes)
+        wav_path = write_temp_wav(wav16k)
+        try:
+            stt = self.stt.transcribe_wav_path(wav_path)
+        finally:
+            safe_unlink(wav_path)
+        transcript = stt.text.strip()
+        if not transcript:
+            raise RuntimeError("Empty transcript")
+        return transcript
 
     def _build_audio_brain_prompt(
         self, transcript: str, session: VoiceSession | None
