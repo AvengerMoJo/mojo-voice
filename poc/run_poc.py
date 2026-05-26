@@ -6,7 +6,7 @@ from mojo_voice.runtime_executorch import ExecuTorchSpeechRuntime
 
 def main() -> None:
     cfg = load_config()
-    print(f"runtime={cfg.voice_runtime} mode={cfg.mcp_mode} mcp={cfg.mcp_url}")
+    print(f"runtime={cfg.voice_runtime} brain_role={cfg.mcp_brain_role} mcp={cfg.mcp_url}")
     runtime = MockSpeechRuntime() if cfg.voice_runtime == "mock" else ExecuTorchSpeechRuntime()
     pipeline = VoiceChatPipeline(cfg, runtime)
     try:

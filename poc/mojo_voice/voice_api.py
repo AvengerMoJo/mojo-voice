@@ -17,18 +17,20 @@ logger = logging.getLogger(__name__)
 # Request / response models                                           #
 # ------------------------------------------------------------------ #
 
-class VoiceQueryRequest(BaseModel):
+class VoiceTurnRequest(BaseModel):
     audio_base64: str = Field(..., description="Base64 WAV; data URI prefix allowed")
-    mcp_mode: str | None = Field(default=None, description="search_memory or dialog")
-    role_id: str | None = Field(default=None)
 
 
-class VoiceQueryResponse(BaseModel):
+class VoiceTurnResponse(BaseModel):
     transcript: str
     reply_text: str
     reply_audio_base64: str
     reply_audio_format: str = "wav"
-    session_id: str | None = None
+    session_id: str
+
+
+class VoiceTranscribeRequest(BaseModel):
+    audio_base64: str = Field(..., description="Base64 WAV; data URI prefix allowed")
 
 
 class VoiceTranscribeResponse(BaseModel):
@@ -77,15 +79,12 @@ class SessionStateResponse(BaseModel):
 async def lifespan(app: FastAPI):
     cfg = load_config()
     service = VoiceService(cfg)
-    try:
-        await service.initialize()
-    except Exception as exc:
-        logger.warning("Voice service warmup failed: %s", exc)
+    await service.initialize()
     app.state.voice_service = service
     yield
 
 
-app = FastAPI(title="mojo-voice API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="mojo-voice API", version="0.4.0", lifespan=lifespan)
 
 
 # ------------------------------------------------------------------ #
@@ -130,42 +129,23 @@ async def get_session(session_id: str):
 
 
 # ------------------------------------------------------------------ #
-# Audio query — session-aware (also keeps the old /voice/query path)  #
+# Voice turn — session-required                                        #
 # ------------------------------------------------------------------ #
 
-async def _run_query(service: VoiceService, req: VoiceQueryRequest, session_id: str | None):
-    try:
-        return await service.query_audio_base64(
-            audio_base64=req.audio_base64,
-            session_id=session_id,
-            mode=req.mcp_mode,
-            role_id=req.role_id,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.post("/voice/query/{session_id}", response_model=VoiceQueryResponse)
-async def voice_query_session(session_id: str, req: VoiceQueryRequest):
+@app.post("/voice/turn/{session_id}", response_model=VoiceTurnResponse)
+async def voice_turn(session_id: str, req: VoiceTurnRequest):
     session = store.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     service: VoiceService = app.state.voice_service
-    res = await _run_query(service, req, session_id)
-    return VoiceQueryResponse(
-        transcript=res.transcript,
-        reply_text=res.reply_text,
-        reply_audio_base64=res.reply_audio_base64,
-        session_id=res.session_id,
-    )
-
-
-@app.post("/voice/query", response_model=VoiceQueryResponse)
-async def voice_query(req: VoiceQueryRequest):
-    """Sessionless fallback — backwards-compatible with existing clients."""
-    service: VoiceService = app.state.voice_service
-    res = await _run_query(service, req, None)
-    return VoiceQueryResponse(
+    try:
+        res = await service.process_turn(
+            audio_base64=req.audio_base64,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return VoiceTurnResponse(
         transcript=res.transcript,
         reply_text=res.reply_text,
         reply_audio_base64=res.reply_audio_base64,
@@ -174,7 +154,7 @@ async def voice_query(req: VoiceQueryRequest):
 
 
 @app.post("/voice/transcribe", response_model=VoiceTranscribeResponse)
-async def voice_transcribe(req: VoiceQueryRequest):
+async def voice_transcribe(req: VoiceTranscribeRequest):
     service: VoiceService = app.state.voice_service
     try:
         transcript = service.transcribe_audio_base64(req.audio_base64)
@@ -226,7 +206,7 @@ async def pending_audio(session_id: str):
 
 
 # ------------------------------------------------------------------ #
-# Poll — context updates for ChatMCP to feed back to text brain       #
+# Poll — context updates for MCP brain to consume                     #
 # ------------------------------------------------------------------ #
 
 @app.get("/voice/context/{session_id}", response_model=PendingContextResponse)

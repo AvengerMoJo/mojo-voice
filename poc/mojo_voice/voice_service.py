@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -22,35 +23,31 @@ from .tts_cosyvoice2 import CosyVoiceTTS
 
 logger = logging.getLogger(__name__)
 
-# Audio brain system prompt — injected on every /voice/query turn.
-_AUDIO_BRAIN_SYSTEM = """\
-You are the audio co-pilot in a two-brain assistant system.
-A powerful text engine is working on the user's request in the background.
+_CONDUCTOR_SYSTEM = """\
+You are a voice conversation conductor. Your job: keep the conversation alive and help the user while a research task runs in the background.
 
-Your parallel responsibilities each turn:
-1. CLARITY — score the user's ask (0.0–1.0). If below 0.7, identify the single
-   most important missing context and ask ONE focused probing question.
-   Never ask more than one question at a time.
-2. CONTEXT — when the user answers a probing question, note the clarification
-   and indicate it should update the text engine.
-3. PRESENT — if there are pending results from the text engine, weave the key
-   point into your reply naturally in 1–2 spoken sentences.
-4. ENGAGE — keep the user engaged and thinking. Never be idle.
+Each turn, pick exactly one move and respond in 1-2 natural spoken sentences:
+- CLARIFY: ask the single most important missing question
+- OPTIONS: offer 2-3 concrete options the user can choose from
+- ACKNOWLEDGE: confirm you received and are working on it
+- BRIDGE: weave in the pending_mcp_result naturally into speech
+- STALL: let the user know it is still processing, keep them engaged
 
-Hard rules:
-- Reply in natural spoken language only. No markdown, no lists, no tables.
-- Maximum 3 sentences per reply. Be concise and expressive.
-- If the user's request is clear and no results are pending, acknowledge briefly
-  and let them know you are working on it.
+Rules:
+- Never more than 2 sentences
+- No markdown, no lists, spoken language only
+- If pending_mcp_result is provided → BRIDGE takes priority
+- If clarity_score < 0.6 → prefer CLARIFY or OPTIONS
+- If text_brain_status is complete and no pending result → BRIDGE last known result
 """
 
 
 @dataclass
-class VoiceQueryResult:
+class VoiceTurnResult:
     transcript: str
     reply_text: str
     reply_audio_base64: str
-    session_id: str | None
+    session_id: str
 
 
 class VoiceService:
@@ -96,18 +93,15 @@ class VoiceService:
         self.tts.load()
 
     # ------------------------------------------------------------------ #
-    # Core audio query — session-aware                                    #
+    # Main turn — two-brain flow                                          #
     # ------------------------------------------------------------------ #
 
-    async def query_audio_base64(
-        self,
-        audio_base64: str,
-        session_id: str | None = None,
-        mode: str | None = None,
-        role_id: str | None = None,
-    ) -> VoiceQueryResult:
-        session = store.get(session_id) if session_id else None
+    async def process_turn(self, audio_base64: str, session_id: str) -> VoiceTurnResult:
+        session = store.get(session_id)
+        if session is None:
+            raise RuntimeError(f"Session not found: {session_id}")
 
+        # STT
         audio_bytes = decode_audio_base64(audio_base64)
         wav16k = to_wav16k_mono_bytes(audio_bytes)
         wav_path = write_temp_wav(wav16k)
@@ -117,40 +111,37 @@ class VoiceService:
             safe_unlink(wav_path)
 
         transcript = stt.text.strip()
+        session.touch()
 
-        if session:
-            session.touch()
-            if not session.original_ask:
-                session.original_ask = transcript
-
-        selected_mode = (mode or self.cfg.mcp_mode or "").strip().lower()
-        # If caller explicitly asks for MCP-backed answer path, route directly.
-        if selected_mode in ("search_memory", "dialog"):
-            reply_text = await self._ask_mcp(transcript, selected_mode, role_id)
+        if not session.original_ask:
+            # First turn: record intent, estimate clarity, dispatch MCP brain
+            session.original_ask = transcript
+            session.clarity_score = self._estimate_clarity(transcript)
+            await self._dispatch_mcp_brain(session)
         else:
-            prompt = self._build_audio_brain_prompt(transcript, session)
-            reply_text = await self._ask_audio_brain(prompt)
-            # Fallback: if audio brain returns placeholder/empty, fetch real MCP answer.
-            if not reply_text.strip() or reply_text.strip().lower() in (
-                "i'm still processing your request.",
-                "i'm still thinking, give me a moment.",
-            ):
-                reply_text = await self._ask_mcp(
-                    transcript,
-                    self.cfg.mcp_mode or "search_memory",
-                    role_id or self.cfg.role_id,
-                )
+            # Subsequent turns: push transcript as context for MCP brain
+            update = ContextUpdate(
+                id=str(uuid.uuid4()),
+                type="clarification",
+                content=f"User said: {transcript}",
+            )
+            session.context_queue.append(update)
+            session.context_version += 1
 
-        # Push any clarification the audio brain produced back to the context queue
-        if session:
-            self._extract_context_update(session, transcript, reply_text)
+        # Poll MCP brain for progress / results
+        await self._poll_mcp_brain(session)
+
+        # Conductor picks a move and replies
+        reply_text = await self._run_conductor(transcript, session)
+        if not reply_text.strip():
+            raise RuntimeError("Conductor returned empty reply")
 
         wav_out = self.tts.synthesize_wav(reply_text)
-        return VoiceQueryResult(
+        return VoiceTurnResult(
             transcript=transcript,
             reply_text=reply_text,
             reply_audio_base64=encode_audio_base64(wav_out),
-            session_id=session.session_id if session else session_id,
+            session_id=session.session_id,
         )
 
     def transcribe_audio_base64(self, audio_base64: str) -> str:
@@ -166,52 +157,135 @@ class VoiceService:
             raise RuntimeError("Empty transcript")
         return transcript
 
-    def _build_audio_brain_prompt(
-        self, transcript: str, session: VoiceSession | None
-    ) -> str:
-        parts = [_AUDIO_BRAIN_SYSTEM]
+    # ------------------------------------------------------------------ #
+    # MCP brain — dispatch and poll                                       #
+    # ------------------------------------------------------------------ #
 
-        if session:
-            pending = session.next_pending_audio()
-            if pending:
-                parts.append(
-                    f"\n[Pending result from text engine — type: {pending.type}]\n"
-                    f"{pending.summary}\n"
-                    f"Present this naturally in your reply, then mark it as delivered.\n"
-                )
-                session.mark_audio_played(pending.id)
+    async def _dispatch_mcp_brain(self, session: VoiceSession) -> None:
+        result = await self.client.call_tool(
+            "scheduler",
+            {
+                "action": "add",
+                "role_id": self.cfg.mcp_brain_role,
+                "goal": session.original_ask,
+                "task_type": "agentic",
+            },
+        )
+        payload = result.tool_payload()
+        task_id = payload.get("task_id")
+        if not task_id:
+            raise RuntimeError(f"Scheduler did not return task_id: {payload}")
+        session.text_brain_task_id = task_id
+        session.text_brain_status = "running"
+        logger.info(
+            "MCP brain dispatched task_id=%s for session %s",
+            task_id, session.session_id,
+        )
 
-            if session.refined_ask and session.refined_ask != session.original_ask:
-                parts.append(f"\n[Refined ask so far]: {session.refined_ask}")
+    async def _poll_mcp_brain(self, session: VoiceSession) -> None:
+        if not session.text_brain_task_id or session.text_brain_status == "complete":
+            return
+        result = await self.client.call_tool(
+            "scheduler",
+            {
+                "action": "get",
+                "task_id": session.text_brain_task_id,
+            },
+        )
+        payload = result.tool_payload()
+        task_status = payload.get("status", "")
 
-            gaps = [m for m in session.missing_context if not m.asked]
-            if gaps:
-                parts.append(
-                    f"\n[Missing context not yet asked]: "
-                    + ", ".join(g.field for g in gaps)
-                )
-
-        parts.append(f"\nUser said: {transcript}")
-        return "\n".join(parts)
-
-    def _extract_context_update(
-        self, session: VoiceSession, transcript: str, reply_text: str
-    ) -> None:
-        """
-        Heuristic: if the audio brain asked a question, record the user's
-        transcript as a context clarification for the text brain.
-        The text brain polls /voice/context to consume these.
-        """
-        if "?" in reply_text:
-            # Audio brain asked something — next user turn will be the answer.
-            # For now push this turn's transcript as context signal.
-            update = ContextUpdate(
-                id=str(uuid.uuid4()),
-                type="clarification",
-                content=f"User said: {transcript}",
+        if task_status in ("completed", "completed_auto_extracted"):
+            session.text_brain_status = "complete"
+            summary = (
+                payload.get("result")
+                or payload.get("reply")
+                or payload.get("goal", "")
             )
-            session.context_queue.append(update)
-            session.context_version += 1
+            if summary:
+                wav_bytes = self.tts.synthesize_wav(str(summary))
+                item = AudioQueueItem(
+                    id=str(uuid.uuid4()),
+                    type="result",
+                    summary=str(summary),
+                    reply_audio_base64=encode_audio_base64(wav_bytes),
+                )
+                session.audio_queue.append(item)
+                logger.info("MCP brain result queued for session %s", session.session_id)
+
+        elif task_status == "failed":
+            session.text_brain_status = "complete"
+            raise RuntimeError(
+                f"MCP brain task {session.text_brain_task_id} failed: "
+                f"{payload.get('error') or payload}"
+            )
+
+        elif task_status == "running":
+            progress = payload.get("progress") or payload.get("working_on", "")
+            if progress:
+                session.text_brain_working_on = str(progress)
+
+    # ------------------------------------------------------------------ #
+    # Conductor — fast 5-move classifier                                  #
+    # ------------------------------------------------------------------ #
+
+    async def _run_conductor(self, transcript: str, session: VoiceSession) -> str:
+        pending = session.next_pending_audio()
+        pending_mcp_result = None
+        if pending:
+            pending_mcp_result = {"type": pending.type, "summary": pending.summary}
+            session.mark_audio_played(pending.id)
+
+        user_message = json.dumps(
+            {
+                "transcript": transcript,
+                "session_context": {
+                    "original_ask": session.original_ask,
+                    "clarity_score": session.clarity_score,
+                    "missing_context": [
+                        m.field for m in session.missing_context if not m.answered
+                    ],
+                    "pending_mcp_result": pending_mcp_result,
+                    "text_brain_status": session.text_brain_status,
+                },
+            },
+            ensure_ascii=False,
+        )
+
+        resource_id = os.getenv("AUDIO_BRAIN_RESOURCE_ID", "lmstudio")
+        result = await self.client.call_tool(
+            "llm_direct_chat",
+            {
+                "system_prompt": _CONDUCTOR_SYSTEM,
+                "message": user_message,
+                "resource_id": resource_id,
+                "max_tokens": 128,
+            },
+        )
+        payload = result.tool_payload()
+        if payload.get("status") == "error":
+            raise RuntimeError(f"Conductor LLM error: {payload.get('message')}")
+
+        reply = (payload.get("reply") or "").strip()
+        resource = payload.get("resource_id", "")
+        model = payload.get("model", "")
+        logger.info(
+            "Conductor reply via %s (%s): %s chars", resource, model, len(reply)
+        )
+        return reply
+
+    # ------------------------------------------------------------------ #
+    # Clarity heuristic                                                   #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _estimate_clarity(text: str) -> float:
+        words = len(text.split())
+        if words < 4:
+            return 0.3
+        if words < 10:
+            return 0.6
+        return 0.85
 
     # ------------------------------------------------------------------ #
     # Push endpoint — text brain → audio queue                           #
@@ -259,94 +333,3 @@ class VoiceService:
         if item:
             session.mark_context_consumed(item.id)
         return item
-
-    # ------------------------------------------------------------------ #
-    # Audio brain — routes through fastest free resource via MoJo pool  #
-    # ------------------------------------------------------------------ #
-
-    async def _ask_audio_brain(self, user_message: str) -> str:
-        """
-        Single-turn LLM call for the audio brain conductor.
-        Uses llm_direct_chat which picks the fastest benchmarked free resource.
-        The system prompt is passed separately so the model treats it correctly.
-        """
-        # Split the built prompt: first section is system, last line is user message
-        # _build_audio_brain_prompt appends "\nUser said: {transcript}" at the end.
-        # We pass the conductor instructions as system_prompt and the user turn separately.
-        lines = user_message.rsplit("\nUser said: ", 1)
-        if len(lines) == 2:
-            system_part = lines[0].strip()
-            user_part = lines[1].strip()
-        else:
-            system_part = _AUDIO_BRAIN_SYSTEM.strip()
-            user_part = user_message.strip()
-
-        resource_id = os.getenv("AUDIO_BRAIN_RESOURCE_ID", "lmstudio")
-        result = await self.client.call_tool(
-            "llm_direct_chat",
-            {
-                "system_prompt": system_part,
-                "message": user_part,
-                "resource_id": resource_id,
-                "max_tokens": 256,
-            },
-        )
-        payload = result.tool_payload()
-        if payload.get("status") == "error":
-            logger.warning("llm_direct_chat error: %s", payload.get("message"))
-            return "I'm still thinking, give me a moment."
-
-        reply = (payload.get("reply") or "").strip()
-        resource = payload.get("resource_id", "")
-        model = payload.get("model", "")
-        logger.info("Audio brain reply via %s (%s): %s chars", resource, model, len(reply))
-        return reply or "I'm still processing your request."
-
-    # ------------------------------------------------------------------ #
-    # MCP helpers — used for memory/dialog fallback and push synthesis   #
-    # ------------------------------------------------------------------ #
-
-    async def _ask_mcp(
-        self, message: str, mode: str | None, role_id: str | None
-    ) -> str:
-        selected_mode = (mode or self.cfg.mcp_mode or "search_memory").strip().lower()
-        if selected_mode == "dialog":
-            return await self._mcp_dialog(message, role_id or self.cfg.role_id)
-        return await self._mcp_search_memory(message)
-
-    async def _mcp_search_memory(self, message: str) -> str:
-        result = await self.client.call_tool(
-            "search_memory",
-            {
-                "query": message,
-                "types": ["conversations", "documents"],
-                "limit_per_type": 3,
-                "max_content_chars": 220,
-            },
-        )
-        payload = result.tool_payload()
-        if payload.get("status") == "error":
-            return str(payload.get("message") or "search_memory failed")
-
-        buckets = payload.get("results", {})
-        lines: list[str] = []
-        for bucket in ("conversations", "documents"):
-            hits = buckets.get(bucket) or []
-            for idx, hit in enumerate(hits, start=1):
-                content = str(hit.get("content") or "").strip()
-                if content:
-                    lines.append(f"{bucket[:-1]} {idx}: {content}")
-        return "\n".join(lines[:4]) if lines else "I could not find relevant memory results."
-
-    async def _mcp_dialog(self, message: str, role_id: str) -> str:
-        args: dict[str, str] = {
-            "action": "chat",
-            "role_id": role_id,
-            "message": message,
-        }
-        result = await self.client.call_tool("dialog", args)
-        payload = result.tool_payload()
-        response = payload.get("response")
-        if isinstance(response, str) and response.strip():
-            return response.strip()
-        return str(payload.get("message") or payload.get("error") or "(No response)")

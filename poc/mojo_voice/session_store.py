@@ -44,6 +44,7 @@ class VoiceSession:
     missing_context: list[MissingContext] = field(default_factory=list)
 
     # text brain state
+    text_brain_task_id: str | None = None
     text_brain_status: str = "idle"  # "idle" | "running" | "complete"
     text_brain_working_on: str = ""
     context_version: int = 0
@@ -92,6 +93,7 @@ class VoiceSession:
                 ],
             },
             "text_brain": {
+                "task_id": self.text_brain_task_id,
                 "status": self.text_brain_status,
                 "working_on": self.text_brain_working_on,
                 "context_version": self.context_version,
